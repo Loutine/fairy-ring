@@ -6,5 +6,20 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-matrix-sdk = { version = "0.6.2", features = ["appservice"] }
-tokio = "1.28.2"
+color-eyre = "0.6.2"
+tokio = { version = "1.28.2", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1.37"
+tracing-subscriber = "0.3.17"
+
+[dependencies.matrix-sdk-appservice]
+# version = "0.6"
+git = "https://github.com/matrix-org/matrix-rust-sdk.git"
+# rev = "9148eaaea13d0"
+branch = "v0.6.x"
+features = ["eyre"]
+
+[profile.dev]
+strip = true
+
+[profile.release]
+strip = true
