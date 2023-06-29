@@ -1,36 +1,22 @@
-use std::{fs::File, future::Future, path::Path, pin::Pin, sync::Arc, time::Duration};
-
-use bytes::Bytes;
 use color_eyre::eyre;
-use matrix_sdk_appservice::AppService;
-// TODO: remove proc_qq
-use proc_qq::re_exports::{
-    ricq::{
-        client::{event::GroupMessageEvent, Connector, DefaultConnector},
-        ext::common::after_login,
-        handler::{Handler, QEvent},
-        Client, Device, LoginResponse, Protocol, QRCodeConfirmed, QRCodeImageFetch, QRCodeState,
-    },
-    ricq_core::{
-        msg::{elem::Text, MessageChain},
-        structs::GroupMessage,
-    },
-    serde_json,
+use matrix_sdk_appservice::{ruma::events::room::message::RoomMessageEventContent, AppService};
+use ricq::{
+    client::{event::GroupMessageEvent, Connector, DefaultConnector},
+    ext::common::after_login,
+    handler::PartlyHandler,
+    msg::elem::RQElem,
+    structs::GroupMessage,
+    Client, Protocol,
 };
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
-use crate::{matrix, MatrixMessage, QQMessage};
+mod login;
 
-pub async fn new_client(appservice: AppService) -> eyre::Result<Arc<Client>> {
-    let device = init_device()?;
+use crate::{config, matrix, MatrixMessage, QQMessage, QQMessageType};
 
-    Ok(Arc::new(Client::new(
-        device,
-        Protocol::AndroidWatch.into(),
-        MatrixForwarder::new(appservice),
-    )))
-}
-
-#[tracing::instrument(skip(client))]
+//#[tracing::instrument(skip(client))]
 pub async fn run_client(client: Arc<Client>) -> eyre::Result<()> {
     let stream = DefaultConnector.connect(&client).await?;
     let handle = {
@@ -39,64 +25,55 @@ pub async fn run_client(client: Arc<Client>) -> eyre::Result<()> {
     };
 
     tokio::task::yield_now().await;
-    qr_login(&client).await?;
+    login::qr_login(&client).await?;
     after_login(&client).await;
+    check_if_group_joined(&client).await;
     handle.await?;
 
     Ok(())
 }
 
-fn init_device() -> eyre::Result<Device> {
-    let device_path = Path::new("device.json");
-    let device = if device_path.exists() {
-        serde_json::from_reader(File::open(device_path)?)?
-    } else {
-        let device = Device::random();
-        serde_json::to_writer(
-            File::options().write(true).create(true).open(device_path)?,
-            &device,
-        )?;
-        device
-    };
-    Ok(device)
+pub async fn new_client(appservice: AppService) -> eyre::Result<Arc<Client>> {
+    let device = login::init_device()?;
+
+    Ok(Arc::new(Client::new(
+        device,
+        Protocol::AndroidWatch.into(),
+        MatrixForwarder::new(appservice),
+    )))
 }
 
-async fn qr_login(client: &Client) -> Result<(), color_eyre::Report> {
-    let mut resp = client.fetch_qrcode().await?;
-    let mut qr_sig = Bytes::new();
-    loop {
-        match &resp {
-            QRCodeState::ImageFetch(QRCodeImageFetch { image_data, sig }) => {
-                qr_sig = sig.clone();
-                tokio::fs::write("qrcode.png", image_data).await?;
-                tracing::info!("Wrote QR code to `qrcode.png`");
-            }
-            QRCodeState::Timeout => {
-                tracing::warn!("Login timeout, requesting new QR");
-                resp = client.fetch_qrcode().await?;
-                // Do not query QR result
-                continue;
-            }
-            QRCodeState::Confirmed(QRCodeConfirmed {
-                tmp_pwd,
-                tmp_no_pic_sig,
-                tgt_qr,
-                ..
-            }) => {
-                let mut login_resp = client.qrcode_login(tmp_pwd, tmp_no_pic_sig, tgt_qr).await?;
-                if let LoginResponse::DeviceLockLogin { .. } = login_resp {
-                    login_resp = client.device_lock_login().await?;
-                }
-                tracing::info!("{login_resp:?}");
-                break Ok(());
-            }
-            QRCodeState::Canceled => panic!("Login is canceled"),
-            _ => (),
-        }
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        resp = client.query_qrcode_result(&qr_sig).await?;
-    }
+// check if bot have already joined groups write in config file
+async fn check_if_group_joined(client: &Arc<Client>) {
+    let group_list: Vec<i64> = client
+        .get_group_list()
+        .await
+        .expect("Can't get group list: ")
+        .iter()
+        .map(|g| g.uin)
+        .collect();
+
+    let group_in_config = config::CONFIG
+        .get()
+        .expect("Can't get config")
+        .qq
+        .groups
+        .clone();
+
+    let group_not_join: Vec<i64> = group_in_config
+        .into_iter()
+        .filter(|g| !group_list.contains(g))
+        .collect();
+    // get the group haven't joined and print
+    client
+        .get_group_infos(group_not_join)
+        .await
+        .expect("Can't get group info: ")
+        .iter()
+        .for_each(|g| tracing::info!("未加入群聊 group name:{}, group id: {}", g.name, g.uin));
 }
+
+// message transit
 
 struct MatrixForwarder {
     appservice: AppService,
@@ -108,63 +85,83 @@ impl MatrixForwarder {
     }
 }
 
-impl Handler for MatrixForwarder {
-    fn handle<'a: 'b, 'b>(
-        &'a self,
-        event: QEvent,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'b>> {
+impl PartlyHandler for MatrixForwarder {
+    fn handle_group_message<'life0, 'async_trait>(
+        &'life0 self,
+        _event: GroupMessageEvent,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
         Box::pin(async move {
-            if let QEvent::GroupMessage(ev) = event {
-                // TODO: filter by group id
-                let e: eyre::Result<()> = try {
-                    let msg = extract_message(&ev).await?;
-                    matrix::send_message(&self.appservice, msg).await?;
-                };
-
-                if let Err(e) = e {
-                    tracing::error!("{e:?}");
+            let GroupMessageEvent {
+                client,
+                inner:
+                    GroupMessage {
+                        group_code, // group id
+                        from_uin,   // user id
+                        elements,   // message
+                        ..
+                    },
+            } = _event;
+	    let mut text_msg: String = String::new();
+	    let mut msg_send: Vec<QQMessageType> = Vec::new();
+            // filter group id
+            if !config::CONFIG.get().unwrap().qq.groups.contains(&group_code) {
+                return ();
+            }
+            for elem in elements.0 {
+                match RQElem::from(elem) {
+                    RQElem::Text(text) => text_msg += &text.content,
+		    RQElem::Face(face) => text_msg += &face.to_string(),
+		    RQElem::MarketFace(face) => text_msg += &format!("[表情:{}]", face.name),
+		    RQElem::GroupImage(img) => {
+			if !text_msg.is_empty() {
+			    msg_send.push(QQMessageType::Text(text_msg.clone()));
+			    text_msg.clear();
+			}
+			msg_send.push(QQMessageType::Img(img.url()))
+		    },
+		    // RQElem::VideoFile(vid) => vid,
+		    // RQElem::At(_) => todo!(),
+                    // RQElem::Dice(_) => todo!(),
+                    // RQElem::FingerGuessing(_) => todo!(),
+                    // RQElem::LightApp(_) => todo!(),
+                    // RQElem::RichMsg(_) => todo!(),
+                    // RQElem::FriendImage(_) => todo!(),
+                    // RQElem::FlashImage(_) => todo!(),
+                    // RQElem::Other(_) => todo!(),
+		    _ => continue,
                 }
             }
+	    if !text_msg.is_empty() {
+		msg_send.push(QQMessageType::Text(text_msg))
+	    }
+	    for qmsg in msg_send.into_iter().map(|msg| create_qq_message(group_code, from_uin,msg)) {
+		let e: eyre::Result<()> = matrix::send_message(&self.appservice, qmsg).await;
+		if let Err(e) = e {
+		    tracing::error!("{e:?}");
+		}
+	    }
         })
     }
 }
 
-async fn extract_message(ev: &GroupMessageEvent) -> eyre::Result<QQMessage> {
-    let GroupMessageEvent {
-        client,
-        inner:
-            GroupMessage {
-                group_code,
-                from_uin,
-                elements,
-                ..
-            },
-    } = ev;
-    let group_id = *group_code;
-    let user_id = *from_uin;
-    // TODO: image
-    let content = elements.to_string();
-    let username = client
-        .get_group_member_info(group_id, user_id)
-        .await?
-        .nickname;
-
-    // TODO: avatar
-
-    Ok(QQMessage {
+fn create_qq_message(group_id: i64, user_id: i64, msg: QQMessageType) -> QQMessage {
+    QQMessage {
         group_id,
         user_id,
-        username,
-        content,
-    })
+        content: msg,
+    }
 }
 
-pub(crate) async fn send_message(client: &Client, msg: MatrixMessage) -> eyre::Result<()> {
-    let message_chain = MessageChain::new(Text::new(format!("{}: {}", msg.username, msg.content)));
+// pub(crate) async fn send_message(client: &Client, msg: MatrixMessage) -> eyre::Result<()> {
+//     let message_chain = MessageChain::new(Text::new(format!("{}: {}", msg.username, msg.content)));
 
-    client
-        .send_group_message(msg.group_id, message_chain)
-        .await?;
+//     client
+//         .send_group_message(msg.group_id, message_chain)
+//         .await?;
 
-    Ok(())
-}
+//     Ok(())
+// }

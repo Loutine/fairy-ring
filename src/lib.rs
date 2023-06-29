@@ -4,12 +4,17 @@ pub mod config;
 pub mod matrix;
 pub mod qq;
 
+enum QQMessageType {
+    Text(String),
+    Img(String),
+}
+
 struct QQMessage {
     group_id: i64,
     user_id: i64,
-    username: String,
+    // username: String,
     // TODO: user avatar
-    content: String,
+    content: QQMessageType
 }
 
 /// Matrix message to transport to qq

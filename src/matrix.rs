@@ -1,3 +1,4 @@
+use ricq::Client;
 use std::sync::Arc;
 
 use color_eyre::eyre::{self, ContextCompat, WrapErr};
@@ -16,6 +17,8 @@ use crate::{
     qq, MatrixMessage, QQMessage,
 };
 
+const USER_PREFIX: &str = "_qq_";
+
 pub async fn new_appservice() -> eyre::Result<AppService> {
     let config = get_config()?;
     let homeserver_url = config.homeserver_url.parse()?;
@@ -33,20 +36,30 @@ pub async fn new_appservice() -> eyre::Result<AppService> {
 
 pub async fn run_appservice(
     appservice: AppService,
-    qq_client: Arc<proc_qq::re_exports::ricq::Client>,
+    qq_client: Arc<Client>,
 ) -> eyre::Result<()> {
     // register the main user
     reg_user(&appservice, None).await?;
 
     appservice
-        .register_user_query(Box::new(|_, _| Box::pin(async { true })))
+        .register_user_query(Box::new(|_, req| Box::pin(async move{
+	    tracing::info!("Got request for User {}", req.user_id);
+	    true
+	})))
         .await;
-
+    
+    appservice
+        .register_room_query(Box::new(|_, req| Box::pin(async move {
+	    tracing::info!("Got request for Room {}", req.room_alias);
+	    true
+	})))
+        .await;
+    
     let client = appservice
         .user(None)
         .await
         .wrap_err("Failed to create a client from AppService")?;
-
+    
     client.add_event_handler_context(qq_client);
     client.add_event_handler_context(appservice.clone());
     client.add_event_handler(handle_message);
@@ -83,7 +96,7 @@ async fn handle_message(
     ev: SyncRoomMessageEvent,
     room: Room,
     Ctx(svc): Ctx<AppService>,
-    Ctx(qq_client): Ctx<Arc<proc_qq::re_exports::ricq::Client>>,
+    Ctx(qq_client): Ctx<Arc<Client>>,
 ) -> eyre::Result<()> {
     if let SyncRoomMessageEvent::Original(ev) = ev {
         let Some(group_id) = room.room_id().localpart().strip_prefix("_qq_") else {
@@ -107,6 +120,7 @@ async fn handle_message(
     Ok(())
 }
 
+// transit QQ message to Matrix
 pub(crate) async fn send_message(appservice: &AppService, msg: QQMessage) -> eyre::Result<()> {
     let QQMessage {
         group_id,
@@ -115,11 +129,15 @@ pub(crate) async fn send_message(appservice: &AppService, msg: QQMessage) -> eyr
         content,
         ..
     } = msg;
-
+    
     // TODO: Users in the group should be registered before-hand
-    let user = appservice
-        .user(Some(&format!("_qq_{user_id}")))
-        .await?;
+    let user_name = virtual_user_name(user_id);
+    
+    let e: eyre::Result<_> = try {appservice.register_user(&user_name, None).await};
+    if let Err(e) = e {
+	tracing::error!("Can't register user: {e}");
+    }
+    let user = appservice.user(Some(&user_name)).await?;
 
     let homeserver: &str = &get_config()?.homeserver_name;
 
@@ -136,4 +154,8 @@ pub(crate) async fn send_message(appservice: &AppService, msg: QQMessage) -> eyr
     room.send(message, None).await?;
 
     Ok(())
+}
+
+pub fn virtual_user_name(id: i64) -> String {
+    format!("{}{}", USER_PREFIX, id.to_string())
 }

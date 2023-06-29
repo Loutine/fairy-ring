@@ -1,22 +1,22 @@
-use std::{fs, sync::OnceLock, path::Path};
+use std::{fs, path::Path, sync::OnceLock};
 
 use color_eyre::eyre;
 use serde::Deserialize;
 
-#[derive(Deserialize)]
+#[derive(Deserialize,Debug)]
 pub struct Config {
     pub qq: QQ,
     pub matrix: Matrix,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct QQ {
     /// QQ groups to bridge
     pub groups: Vec<i64>,
 }
 
 // TODO: store parsed versions
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct Matrix {
     /// Target homeserver's name, like `matrix.org`
     pub homeserver_name: String,
@@ -31,4 +31,17 @@ pub fn init<P: AsRef<Path>>(path: P) -> eyre::Result<()> {
     CONFIG
         .set(config)
         .map_err(|_| eyre::eyre!("Failed to initialize config"))
+}
+
+#[cfg(test)]
+mod test {
+    #[test]
+    fn init_test() {
+	use super::*;
+	if let Ok(_) = init("./config.toml") {
+	    let content = CONFIG.get().unwrap();
+	    eprintln!("{:?}", content);
+	    assert!(true);
+	}
+    }
 }
