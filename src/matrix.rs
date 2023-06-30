@@ -158,7 +158,7 @@ pub(crate) async fn send_message(appservice: &AppService, msg: QQMessage) -> eyr
         ..
     } = msg;
 
-    // TODO: Users in the group should be registered before-hand
+    // Users in the group should be registered before-hand
     let user_name = virtual_user_name(user_id);
 
     reg_user(appservice, Some(&user_name)).await?;
