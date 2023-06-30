@@ -1,5 +1,5 @@
 use color_eyre::eyre;
-use matrix_sdk_appservice::{ruma::events::room::message::RoomMessageEventContent, AppService};
+use matrix_sdk_appservice::AppService;
 use ricq::{
     client::{event::GroupMessageEvent, Connector, DefaultConnector},
     ext::common::after_login,
@@ -8,6 +8,7 @@ use ricq::{
     structs::GroupMessage,
     Client, Protocol,
 };
+use ricq_core::msg::{MessageChainBuilder, elem::Text};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -111,6 +112,17 @@ impl PartlyHandler for MatrixForwarder {
             if !config::CONFIG.get().unwrap().qq.groups.contains(&group_code) {
                 return ();
             }
+	    // get group member info
+	    let group_mem_info = client.get_group_member_info(group_code, from_uin).await;
+
+	    let group_card_name = match group_mem_info {
+		Err(e) => {
+		    tracing::error!("Get Error while request for group member info : {e}");
+		    "".into()
+		}
+		Ok(gi) => gi.card_name,
+	    };
+	    
             for elem in elements.0 {
                 match RQElem::from(elem) {
                     RQElem::Text(text) => text_msg += &text.content,
@@ -135,11 +147,19 @@ impl PartlyHandler for MatrixForwarder {
 		    _ => continue,
                 }
             }
+	    
 	    if !text_msg.is_empty() {
 		msg_send.push(QQMessageType::Text(text_msg))
 	    }
-	    for qmsg in msg_send.into_iter().map(|msg| create_qq_message(group_code, from_uin,msg)) {
-		let e: eyre::Result<()> = matrix::send_message(&self.appservice, qmsg).await;
+	    
+	    for qmsg in msg_send {
+		let msg = QQMessage {
+		    group_id: group_code,
+		    user_id: from_uin,
+		    display_name: group_card_name.clone(),
+		    content: qmsg,
+		};
+		let e: eyre::Result<()> = matrix::send_message(&self.appservice, msg).await;
 		if let Err(e) = e {
 		    tracing::error!("{e:?}");
 		}
@@ -148,20 +168,32 @@ impl PartlyHandler for MatrixForwarder {
     }
 }
 
-fn create_qq_message(group_id: i64, user_id: i64, msg: QQMessageType) -> QQMessage {
-    QQMessage {
-        group_id,
-        user_id,
-        content: msg,
+
+// use MessageChainBuilder instead
+pub(crate) async fn send_message(client: &Client, msg: MatrixMessage) -> eyre::Result<()> {
+    match msg.content {
+        crate::MatrixMessageType::Text(content) => {
+	    let mut message_chain = MessageChainBuilder::new();
+	    message_chain.push(Text::new(format!("{}: {}", msg.username, content)));
+	    client
+		.send_group_message(msg.group_id, message_chain.build())
+		.await?;
+	},
+        crate::MatrixMessageType::Img(img) => {
+	    send_group_image(client, msg.group_id, &img[..]).await?;
+	},
     }
+    Ok(())
 }
 
-// pub(crate) async fn send_message(client: &Client, msg: MatrixMessage) -> eyre::Result<()> {
-//     let message_chain = MessageChain::new(Text::new(format!("{}: {}", msg.username, msg.content)));
+// helper function for sending group image message
+async fn send_group_image(client:&Client, group_code:i64, data:&[u8]) -> eyre::Result<()>{
+    let result = client.upload_group_image(group_code, data).await;
+    if let Ok(gi) = result {
+	let mut msg_builder = MessageChainBuilder::new();
+	msg_builder.push(gi);
 
-//     client
-//         .send_group_message(msg.group_id, message_chain)
-//         .await?;
-
-//     Ok(())
-// }
+	client.send_group_message(group_code, msg_builder.build()).await?;
+    }
+    Ok(())
+}

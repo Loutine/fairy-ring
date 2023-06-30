@@ -1,12 +1,20 @@
+use mime::Mime;
 use ricq::Client;
-use std::sync::Arc;
+use std::{str::FromStr, sync::Arc};
 
 use color_eyre::eyre::{self, ContextCompat, WrapErr};
 use matrix_sdk_appservice::{
-    matrix_sdk::{event_handler::Ctx, room::Room},
+    matrix_sdk::{
+        attachment::AttachmentConfig,
+        event_handler::Ctx,
+        reqwest::{self, header::CONTENT_TYPE}, room::Room,
+    },
     ruma::{
         api::client,
-        events::room::message::{MessageType, RoomMessageEventContent, SyncRoomMessageEvent},
+        events::room::{
+            member::{MembershipState, RoomMemberEventContent},
+            message::{MessageType, RoomMessageEventContent, SyncRoomMessageEvent},
+        },
         OwnedServerName, RoomOrAliasId,
     },
     AppService, AppServiceRegistration,
@@ -14,7 +22,7 @@ use matrix_sdk_appservice::{
 
 use crate::{
     config::{self, CONFIG},
-    qq, MatrixMessage, QQMessage,
+    qq, MatrixMessage, QQMessage, MatrixMessageType,
 };
 
 const USER_PREFIX: &str = "_qq_";
@@ -34,32 +42,33 @@ pub async fn new_appservice() -> eyre::Result<AppService> {
     Ok(appservice)
 }
 
-pub async fn run_appservice(
-    appservice: AppService,
-    qq_client: Arc<Client>,
-) -> eyre::Result<()> {
+pub async fn run_appservice(appservice: AppService, qq_client: Arc<Client>) -> eyre::Result<()> {
     // register the main user
     reg_user(&appservice, None).await?;
 
     appservice
-        .register_user_query(Box::new(|_, req| Box::pin(async move{
-	    tracing::info!("Got request for User {}", req.user_id);
-	    true
-	})))
+        .register_user_query(Box::new(|_, req| {
+            Box::pin(async move {
+                tracing::info!("Got request for User {}", req.user_id);
+                true
+            })
+        }))
         .await;
-    
+
     appservice
-        .register_room_query(Box::new(|_, req| Box::pin(async move {
-	    tracing::info!("Got request for Room {}", req.room_alias);
-	    true
-	})))
+        .register_room_query(Box::new(|_, req| {
+            Box::pin(async move {
+                tracing::info!("Got request for Room {}", req.room_alias);
+                true
+            })
+        }))
         .await;
-    
+
     let client = appservice
         .user(None)
         .await
         .wrap_err("Failed to create a client from AppService")?;
-    
+
     client.add_event_handler_context(qq_client);
     client.add_event_handler_context(appservice.clone());
     client.add_event_handler(handle_message);
@@ -109,10 +118,29 @@ async fn handle_message(
                         format!("Failed to parse group_id; input was {group_id}")
                     })?,
                     username: ev.sender.into(),
-                    content: t.body,
+                    content: MatrixMessageType::Text(t.body),
                 };
 
                 qq::send_message(&qq_client, msg).await?;
+            } else if let MessageType::Image(img) = ev.content.msgtype {
+		match svc.user(None).await {
+		    Ok(client) => {
+			let result = client.media().get_file(img,true).await; //use cache
+			if let Ok(Some(img)) = result {
+			    let msg = MatrixMessage {
+				group_id: group_id.parse().wrap_err_with(|| {
+				    format!("Failed to parse group_id; input was {group_id}")
+				})?,
+				username: ev.sender.into(),
+				content: MatrixMessageType::Img(img),
+			    };
+			    qq::send_message(&qq_client, msg).await?
+			} else {
+			    tracing::error!("Can't get img content or no img");
+			}
+		    },
+		    Err(e) => tracing::error!("failed to get client {e}"),
+		}	
             }
         }
     }
@@ -125,18 +153,16 @@ pub(crate) async fn send_message(appservice: &AppService, msg: QQMessage) -> eyr
     let QQMessage {
         group_id,
         user_id,
-        // username, // TODO: handle username
+        display_name,
         content,
         ..
     } = msg;
-    
+
     // TODO: Users in the group should be registered before-hand
     let user_name = virtual_user_name(user_id);
-    
-    let e: eyre::Result<_> = try {appservice.register_user(&user_name, None).await};
-    if let Err(e) = e {
-	tracing::error!("Can't register user: {e}");
-    }
+
+    reg_user(appservice, Some(&user_name)).await?;
+
     let user = appservice.user(Some(&user_name)).await?;
 
     let homeserver: &str = &get_config()?.homeserver_name;
@@ -147,11 +173,36 @@ pub(crate) async fn send_message(appservice: &AppService, msg: QQMessage) -> eyr
         .await
         .wrap_err_with(|| format!("Virtual user {user_id} failed to join room {room_alias}"))?;
 
-    // TODO: Send state event to set room nick
+    // Send state event to set room nick
+    // WARNING!: Don't know if this state event changer works
+    // this code hasn't been test
+    let mut change_nick = RoomMemberEventContent::new(MembershipState::Join);
+    change_nick.displayname = Some(display_name);
+    
+    match room.send_state_event_for_key(user.user_id().unwrap(), change_nick).await {
+        Ok(_) => tracing::info!("user room nick change response"),
+        Err(e) => tracing::error!("Can't change room nick {e}"),
+    };
 
-    let message = RoomMessageEventContent::text_plain(content);
 
-    room.send(message, None).await?;
+    
+    // send qq message
+    match content {
+        crate::QQMessageType::Text(text) => {
+            room.send(RoomMessageEventContent::text_plain(text), None)
+                .await?;
+        }
+        crate::QQMessageType::Img(url) => {
+            let response = reqwest::get(url).await?;
+            let headers = response.headers();
+            // if we need to have a file name and cache?
+            // let file_name = headers.get(CONTENT_DISPOSITION).unwrap();
+            let mime_type = Mime::from_str(headers.get(CONTENT_TYPE).unwrap().to_str()?)?;
+            let content = response.bytes().await?;
+            room.send_attachment("", &mime_type, content.to_vec(), AttachmentConfig::new())
+                .await?;
+        }
+    }
 
     Ok(())
 }

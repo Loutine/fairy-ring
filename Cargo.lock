@@ -570,6 +570,7 @@ dependencies = [
  "bytes",
  "color-eyre",
  "matrix-sdk-appservice",
+ "mime",
  "ricq",
  "ricq-core",
  "serde",
