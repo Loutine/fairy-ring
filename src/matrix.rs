@@ -27,7 +27,6 @@ use crate::{
 };
 
 const USER_PREFIX: &str = "_qq_";
-const AVATAR_REQUEST_STRING: &str = "https://q1.qlogo.cn/g?b=qq&nk={}&s=640";
 
 pub async fn new_appservice() -> eyre::Result<AppService> {
     let config = get_config()?;
