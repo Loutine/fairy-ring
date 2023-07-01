@@ -7,7 +7,8 @@ use matrix_sdk_appservice::{
     matrix_sdk::{
         attachment::AttachmentConfig,
         event_handler::Ctx,
-        reqwest::{self, header::CONTENT_TYPE}, room::Room,
+        reqwest::{self, header::CONTENT_TYPE},
+        room::Room,
     },
     ruma::{
         api::client,
@@ -22,10 +23,11 @@ use matrix_sdk_appservice::{
 
 use crate::{
     config::{self, CONFIG},
-    qq, MatrixMessage, QQMessage, MatrixMessageType,
+    qq, MatrixMessage, MatrixMessageType, QQMessage,
 };
 
 const USER_PREFIX: &str = "_qq_";
+const AVATAR_REQUEST_STRING: &str = "https://q1.qlogo.cn/g?b=qq&nk={}&s=640";
 
 pub async fn new_appservice() -> eyre::Result<AppService> {
     let config = get_config()?;
@@ -88,10 +90,29 @@ fn get_config() -> eyre::Result<&'static config::Matrix> {
 }
 
 async fn reg_user(appservice: &AppService, localpart: Option<&str>) -> eyre::Result<()> {
-    let localpart =
-        localpart.unwrap_or_else(|| appservice.registration().sender_localpart.as_str());
-    match appservice.register_user(localpart, None).await {
-        Ok(_) => (),
+    let localpart_get = localpart
+        .clone()
+        .unwrap_or_else(|| appservice.registration().sender_localpart.as_str());
+    match appservice.register_user(localpart_get, None).await {
+        Ok(_) => {
+            // init the avatar of puppet user
+            if let Some(str) = localpart {
+                let avatar_response =
+                    reqwest::get(format!("https://q1.qlogo.cn/g?b=qq&nk={}&s=640", str)).await?;
+
+                let headers = avatar_response.headers();
+                // if we need to have a file name and cache?
+                // let file_name = headers.get(CONTENT_DISPOSITION).unwrap();
+                let mime_type = Mime::from_str(headers.get(CONTENT_TYPE).unwrap().to_str()?)?;
+                let content = avatar_response.bytes().await?;
+                let user = appservice.user(Some(str)).await?;
+                let response = user.media().upload(&mime_type, content.to_vec()).await?;
+
+                user.account()
+                    .set_avatar_url(Some(&response.content_uri))
+                    .await?
+            }
+        }
         // Ok if user has already been registered
         Err(matrix_sdk_appservice::Error::Matrix(e))
             if e.client_api_error_kind() == Some(&client::error::ErrorKind::UserInUse) => {}
@@ -113,6 +134,7 @@ async fn handle_message(
         };
         if !svc.user_id_is_in_namespace(&ev.sender) {
             if let MessageType::Text(t) = ev.content.msgtype {
+                // Text message
                 let msg = MatrixMessage {
                     group_id: group_id.parse().wrap_err_with(|| {
                         format!("Failed to parse group_id; input was {group_id}")
@@ -123,24 +145,25 @@ async fn handle_message(
 
                 qq::send_message(&qq_client, msg).await?;
             } else if let MessageType::Image(img) = ev.content.msgtype {
-		match svc.user(None).await {
-		    Ok(client) => {
-			let result = client.media().get_file(img,true).await; //use cache
-			if let Ok(Some(img)) = result {
-			    let msg = MatrixMessage {
-				group_id: group_id.parse().wrap_err_with(|| {
-				    format!("Failed to parse group_id; input was {group_id}")
-				})?,
-				username: ev.sender.into(),
-				content: MatrixMessageType::Img(img),
-			    };
-			    qq::send_message(&qq_client, msg).await?
-			} else {
-			    tracing::error!("Can't get img content or no img");
-			}
-		    },
-		    Err(e) => tracing::error!("failed to get client {e}"),
-		}	
+                // Image message
+                match svc.user(None).await {
+                    Ok(client) => {
+                        let result = client.media().get_file(img, true).await; //use cache
+                        if let Ok(Some(img)) = result {
+                            let msg = MatrixMessage {
+                                group_id: group_id.parse().wrap_err_with(|| {
+                                    format!("Failed to parse group_id; input was {group_id}")
+                                })?,
+                                username: ev.sender.into(),
+                                content: MatrixMessageType::Img(img),
+                            };
+                            qq::send_message(&qq_client, msg).await?
+                        } else {
+                            tracing::error!("Can't get img content or no img");
+                        }
+                    }
+                    Err(e) => tracing::error!("failed to get client {e}"),
+                }
             }
         }
     }
@@ -160,7 +183,6 @@ pub(crate) async fn send_message(appservice: &AppService, msg: QQMessage) -> eyr
 
     // Users in the group should be registered before-hand
     let user_name = virtual_user_name(user_id);
-
     reg_user(appservice, Some(&user_name)).await?;
 
     let user = appservice.user(Some(&user_name)).await?;
@@ -178,14 +200,15 @@ pub(crate) async fn send_message(appservice: &AppService, msg: QQMessage) -> eyr
     // this code hasn't been test
     let mut change_nick = RoomMemberEventContent::new(MembershipState::Join);
     change_nick.displayname = Some(display_name);
-    
-    match room.send_state_event_for_key(user.user_id().unwrap(), change_nick).await {
+
+    match room
+        .send_state_event_for_key(user.user_id().unwrap(), change_nick)
+        .await
+    {
         Ok(_) => tracing::info!("user room nick change response"),
         Err(e) => tracing::error!("Can't change room nick {e}"),
     };
 
-
-    
     // send qq message
     match content {
         crate::QQMessageType::Text(text) => {

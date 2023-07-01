@@ -40,8 +40,10 @@ mod test {
 	use super::*;
 	if let Ok(_) = init("./config.toml") {
 	    let content = CONFIG.get().unwrap();
-	    eprintln!("{:?}", content);
-	    assert!(true);
+	    println!("this is the content {:?}", content);
+	    assert!(true)
+	} else {
+	    println!("error")
 	}
     }
 }
